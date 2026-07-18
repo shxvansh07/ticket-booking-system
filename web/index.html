@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ticket Booking — Live Seat Map</title>
+<style>
+  :root { --available: #3fb56d; --held: #e0a821; --booked: #c0392b; --mine: #2e6fd9; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; background: #0f1216; color: #eef2f5; }
+  header { padding: 16px 24px; border-bottom: 1px solid #232a31; display: flex; justify-content: space-between; align-items: center; }
+  header h1 { font-size: 18px; margin: 0; }
+  #eventInfo { color: #9aa7b0; font-size: 13px; }
+  #queuePanel { padding: 14px 24px; background: #17202a; border-bottom: 1px solid #232a31; display: none; align-items: center; gap: 14px; }
+  #queuePanel.visible { display: flex; }
+  button { background: var(--mine); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { background: #444; cursor: not-allowed; }
+  main { padding: 20px 24px; }
+  .legend { display: flex; gap: 18px; margin-bottom: 16px; font-size: 13px; color: #9aa7b0; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .section { margin-bottom: 22px; }
+  .section h3 { font-size: 13px; color: #9aa7b0; text-transform: uppercase; letter-spacing: .5px; margin: 0 0 8px 0; }
+  .row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .row-label { width: 22px; font-size: 11px; color: #6c7883; text-align: right; }
+  .seat { width: 22px; height: 22px; border-radius: 4px; background: var(--available); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 9px; color: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.08); }
+  .seat.held { background: var(--held); cursor: not-allowed; }
+  .seat.booked { background: var(--booked); cursor: not-allowed; }
+  .seat.mine { background: var(--mine); cursor: pointer; }
+  #holdPanel { position: fixed; bottom: 0; left: 0; right: 0; background: #17202a; border-top: 1px solid #232a31; padding: 16px 24px; display: none; align-items: center; gap: 16px; }
+  #holdPanel.visible { display: flex; }
+  #countdown { font-variant-numeric: tabular-nums; color: var(--held); }
+  #toast { position: fixed; top: 16px; right: 16px; background: #1e2933; border: 1px solid #2e3a44; padding: 10px 16px; border-radius: 6px; font-size: 13px; max-width: 320px; display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🎟️ Concurrency-Safe Ticket Booking</h1>
+  <div id="eventInfo">Loading…</div>
+</header>
+
+<div id="queuePanel">
+  <span>This is a high-demand event — join the virtual queue to book.</span>
+  <button id="joinQueueBtn">Join Queue</button>
+  <span id="queueStatusText"></span>
+</div>
+
+<main>
+  <div class="legend">
+    <span><span class="swatch" style="background:var(--available)"></span> Available</span>
+    <span><span class="swatch" style="background:var(--held)"></span> Held (by someone)</span>
+    <span><span class="swatch" style="background:var(--booked)"></span> Booked</span>
+    <span><span class="swatch" style="background:var(--mine)"></span> Held by you</span>
+  </div>
+  <div id="seatMap">Loading seat map…</div>
+</main>
+
+<div id="holdPanel">
+  <span>Seat <b id="heldSeatLabel"></b> held for you — <span id="countdown"></span></span>
+  <button id="confirmBtn">Confirm Booking</button>
+  <button id="releaseBtn" style="background:#444;">Release</button>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const API_BASE = "http://127.0.0.1:8100";
+const params = new URLSearchParams(location.search);
+const EVENT_ID = params.get("event_id") || "2";
+
+const USER_TOKEN = (() => {
+  let t = localStorage.getItem("user_token");
+  if (!t) {
+    t = "web-user-" + Math.random().toString(36).slice(2, 10);
+    localStorage.setItem("user_token", t);
+  }
+  return t;
+})();
+
+let event = null;
+let seatsById = {};
+let heldSeatId = null;
+let holdTimer = null;
+let admitted = false;
+
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.style.display = "block";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.style.display = "none", 3500);
+}
+
+async function loadEvent() {
+  const res = await fetch(`${API_BASE}/events/${EVENT_ID}`);
+  event = await res.json();
+  document.getElementById("eventInfo").textContent =
+    `${event.name} — ${event.venue}${event.high_demand ? "  ·  HIGH DEMAND" : ""}`;
+  if (event.high_demand) {
+    document.getElementById("queuePanel").classList.add("visible");
+    await checkQueueStatus();
+  } else {
+    admitted = true;
+  }
+}
+
+async function checkQueueStatus() {
+  const res = await fetch(`${API_BASE}/events/${EVENT_ID}/queue/status?token=${USER_TOKEN}`);
+  const status = await res.json();
+  admitted = status.admitted;
+  const text = document.getElementById("queueStatusText");
+  if (admitted) {
+    text.textContent = "✓ Admitted — you can book now.";
+    document.getElementById("joinQueueBtn").disabled = true;
+  } else if (status.position) {
+    text.textContent = `Position in queue: ${status.position}`;
+  } else {
+    text.textContent = "";
+  }
+}
+
+document.getElementById("joinQueueBtn").addEventListener("click", async () => {
+  await fetch(`${API_BASE}/events/${EVENT_ID}/queue/join`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: USER_TOKEN }),
+  });
+  const poll = setInterval(async () => {
+    await checkQueueStatus();
+    if (admitted) clearInterval(poll);
+  }, 1000);
+});
+
+async function loadSeatMap() {
+  const res = await fetch(`${API_BASE}/events/${EVENT_ID}/seats`);
+  const seats = await res.json();
+  seatsById = Object.fromEntries(seats.map(s => [s.id, s]));
+  renderSeatMap(seats);
+}
+
+function renderSeatMap(seats) {
+  const bySection = {};
+  for (const s of seats) {
+    (bySection[s.section] ??= {});
+    (bySection[s.section][s.row_label] ??= []).push(s);
+  }
+  const root = document.getElementById("seatMap");
+  root.innerHTML = "";
+  for (const [section, rows] of Object.entries(bySection)) {
+    const sectionEl = document.createElement("div");
+    sectionEl.className = "section";
+    sectionEl.innerHTML = `<h3>${section}</h3>`;
+    for (const [rowLabel, rowSeats] of Object.entries(rows)) {
+      const rowEl = document.createElement("div");
+      rowEl.className = "row";
+      rowEl.innerHTML = `<span class="row-label">${rowLabel}</span>`;
+      rowSeats.sort((a, b) => a.seat_number - b.seat_number).forEach(s => {
+        const seatEl = document.createElement("div");
+        seatEl.className = "seat " + statusClass(s);
+        seatEl.dataset.seatId = s.id;
+        seatEl.title = `${section} ${rowLabel}${s.seat_number} — ₹${(s.price_cents / 100).toFixed(0)}`;
+        seatEl.textContent = s.seat_number;
+        seatEl.addEventListener("click", () => onSeatClick(s.id));
+        rowEl.appendChild(seatEl);
+      });
+      sectionEl.appendChild(rowEl);
+    }
+    root.appendChild(sectionEl);
+  }
+}
+
+function statusClass(seat) {
+  if (seat.status === "booked") return "booked";
+  if (seat.id === heldSeatId) return "mine";
+  if (seat.status === "held") return "held";
+  return "";
+}
+
+function updateSeatVisual(seatId) {
+  const el = document.querySelector(`.seat[data-seat-id="${seatId}"]`);
+  const seat = seatsById[seatId];
+  if (el && seat) el.className = "seat " + statusClass(seat);
+}
+
+async function onSeatClick(seatId) {
+  const seat = seatsById[seatId];
+  if (!seat) return;
+  if (seat.status === "booked") return;
+  if (seat.id === heldSeatId) return; // already yours, use the hold panel
+  if (seat.status === "held") { toast("That seat is currently held by someone else."); return; }
+  if (event.high_demand && !admitted) { toast("Join the queue first."); return; }
+
+  const res = await fetch(`${API_BASE}/seats/${seatId}/hold`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_token: USER_TOKEN }),
+  });
+  if (res.status !== 200) {
+    const body = await res.json();
+    toast(body.detail || "Could not hold seat.");
+    return;
+  }
+  const data = await res.json();
+  heldSeatId = seatId;
+  seat.status = "held";
+  updateSeatVisual(seatId);
+  showHoldPanel(seat, new Date(data.held_until));
+}
+
+function showHoldPanel(seat, heldUntil) {
+  document.getElementById("heldSeatLabel").textContent =
+    `${seat.section} ${seat.row_label}${seat.seat_number}`;
+  document.getElementById("holdPanel").classList.add("visible");
+  clearInterval(holdTimer);
+  holdTimer = setInterval(() => {
+    const secondsLeft = Math.max(0, Math.floor((heldUntil - new Date()) / 1000));
+    const m = Math.floor(secondsLeft / 60), s = secondsLeft % 60;
+    document.getElementById("countdown").textContent = `${m}:${s.toString().padStart(2, "0")} remaining`;
+    if (secondsLeft <= 0) {
+      clearInterval(holdTimer);
+      document.getElementById("holdPanel").classList.remove("visible");
+      heldSeatId = null;
+    }
+  }, 250);
+}
+
+document.getElementById("confirmBtn").addEventListener("click", async () => {
+  if (!heldSeatId) return;
+  const idempotencyKey = `${USER_TOKEN}-${heldSeatId}-confirm`;
+  const res = await fetch(`${API_BASE}/bookings/confirm`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ seat_id: heldSeatId, user_token: USER_TOKEN, idempotency_key: idempotencyKey }),
+  });
+  if (res.status === 200) {
+    toast("Booking confirmed! 🎉");
+    seatsById[heldSeatId].status = "booked";
+    updateSeatVisual(heldSeatId);
+    document.getElementById("holdPanel").classList.remove("visible");
+    clearInterval(holdTimer);
+    heldSeatId = null;
+  } else {
+    const body = await res.json();
+    toast(body.detail || "Could not confirm booking.");
+  }
+});
+
+document.getElementById("releaseBtn").addEventListener("click", async () => {
+  if (!heldSeatId) return;
+  await fetch(`${API_BASE}/seats/${heldSeatId}/release`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_token: USER_TOKEN }),
+  });
+  seatsById[heldSeatId].status = "available";
+  updateSeatVisual(heldSeatId);
+  document.getElementById("holdPanel").classList.remove("visible");
+  clearInterval(holdTimer);
+  heldSeatId = null;
+});
+
+function connectWebSocket() {
+  const wsUrl = API_BASE.replace("http", "ws") + `/ws/events/${EVENT_ID}`;
+  const ws = new WebSocket(wsUrl);
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    const seat = seatsById[msg.seat_id];
+    if (!seat) return;
+    if (msg.seat_id === heldSeatId && msg.status !== "held") {
+      // our own hold expired/got released server-side
+      heldSeatId = null;
+      document.getElementById("holdPanel").classList.remove("visible");
+      clearInterval(holdTimer);
+    }
+    seat.status = msg.status;
+    updateSeatVisual(msg.seat_id);
+  };
+  ws.onclose = () => setTimeout(connectWebSocket, 2000);
+}
+
+(async function init() {
+  await loadEvent();
+  await loadSeatMap();
+  connectWebSocket();
+})();
+</script>
+</body>
+</html>
